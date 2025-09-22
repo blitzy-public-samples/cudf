@@ -62,9 +62,16 @@ struct dispatch_copy_from_arrow_host {
     auto* bitmap = array->buffers[validity_buffer_idx];
     if (bitmap == nullptr) { return std::make_unique<rmm::device_buffer>(0, stream, mr); }
 
-    auto const bitmask_size = array->length + array->offset;
+    // CRITICAL FIX: Handle large Arrow arrays safely
+    // For sliced arrays, we need the full underlying buffer size to copy correctly
+    // but we must validate it fits within size_type bounds before casting
+    int64_t const bitmask_size64 = array->length + array->offset;
+    CUDF_EXPECTS(bitmask_size64 <= std::numeric_limits<size_type>::max(),
+                 "Bitmask size " + std::to_string(bitmask_size64) + 
+                 " exceeds maximum size_type limit " + 
+                 std::to_string(std::numeric_limits<size_type>::max()));
     auto const allocation_size =
-      bitmask_allocation_size_bytes(static_cast<size_type>(bitmask_size));
+      bitmask_allocation_size_bytes(static_cast<size_type>(bitmask_size64));
     auto mask = std::make_unique<rmm::device_buffer>(allocation_size, stream, mr);
     CUDF_CUDA_TRY(cudaMemcpyAsync(mask->data(),
                                   reinterpret_cast<uint8_t const*>(bitmap),
@@ -88,17 +95,32 @@ struct dispatch_copy_from_arrow_host {
   {
     using DeviceType = device_storage_type_t<T>;
 
-    size_type const num_rows   = input->length;
-    size_type const offset     = input->offset;
+    // CRITICAL FIX: Handle large Arrow arrays safely
+    // Arrow uses int64_t for offsets/lengths, cuDF uses int32_t (size_type)
+    // When Arrow arrays exceed 2^31 rows and are sliced, the offset can overflow
+    // Solution: Use int64_t for calculations, validate slice fits in size_type
+    int64_t const num_rows64 = input->length;
+    int64_t const offset64 = input->offset;
+    
+    // Validate the slice length fits within cuDF's limits
+    CUDF_EXPECTS(num_rows64 <= std::numeric_limits<size_type>::max(),
+                 "Arrow array slice length " + std::to_string(num_rows64) + 
+                 " exceeds cuDF maximum column size " + 
+                 std::to_string(std::numeric_limits<size_type>::max()));
+    
+    size_type const num_rows = static_cast<size_type>(num_rows64);
     size_type const null_count = input->null_count;
     auto data_buffer           = input->buffers[fixed_width_data_buffer_idx];
 
     auto const has_nulls = skip_mask ? false : input->buffers[validity_buffer_idx] != nullptr;
     auto col = make_fixed_width_column(type, num_rows, mask_state::UNALLOCATED, stream, mr);
     auto mutable_column_view = col->mutable_view();
+    // FIX: Use int64_t offset calculation to prevent overflow in pointer arithmetic
+    // Arrow's buffer pointer already points to the correct location for sliced arrays
+    // We need to use offset64 to avoid integer overflow when calculating the byte offset
     CUDF_CUDA_TRY(
       cudaMemcpyAsync(mutable_column_view.data<DeviceType>(),
-                      reinterpret_cast<uint8_t const*>(data_buffer) + offset * sizeof(DeviceType),
+                      reinterpret_cast<uint8_t const*>(data_buffer) + offset64 * sizeof(DeviceType),
                       sizeof(DeviceType) * num_rows,
                       cudaMemcpyDefault,
                       stream.value()));
@@ -107,11 +129,15 @@ struct dispatch_copy_from_arrow_host {
       auto tmp_mask = get_mask_buffer(input);
 
       // if array is sliced, we have to copy the whole mask and then take copy
+      // Use offset64 to ensure proper handling of large offsets
       auto out_mask =
-        (offset == 0)
+        (offset64 == 0)
           ? std::move(*tmp_mask)
-          : cudf::detail::copy_bitmask(
-              static_cast<bitmask_type*>(tmp_mask->data()), offset, offset + num_rows, stream, mr);
+          : cudf::detail::copy_bitmask(static_cast<bitmask_type*>(tmp_mask->data()),
+                                       static_cast<size_type>(offset64),
+                                       static_cast<size_type>(offset64) + num_rows, 
+                                       stream, 
+                                       mr);
 
       col->set_null_mask(std::move(out_mask), null_count);
     }
@@ -126,8 +152,13 @@ std::unique_ptr<column> dispatch_copy_from_arrow_host::operator()<bool>(ArrowSch
                                                                         data_type type,
                                                                         bool skip_mask)
 {
-  auto data_buffer         = input->buffers[fixed_width_data_buffer_idx];
-  auto const buffer_length = bitmask_allocation_size_bytes(input->length + input->offset);
+  auto data_buffer = input->buffers[fixed_width_data_buffer_idx];
+  // FIX: Only allocate space for the slice, not the entire underlying array  
+  // This prevents attempting to allocate 18+ exabytes for large sliced bool arrays
+  // First validate the slice length fits within size_type bounds
+  CUDF_EXPECTS(input->length <= std::numeric_limits<size_type>::max(),
+               "Boolean array slice length exceeds maximum size_type limit");
+  auto const buffer_length = bitmask_allocation_size_bytes(static_cast<size_type>(input->length));
 
   auto data = rmm::device_buffer(buffer_length, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(data.data(),
